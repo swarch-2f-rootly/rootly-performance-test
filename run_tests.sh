@@ -1,10 +1,14 @@
 #!/bin/bash
-# Script para ejecutar las pruebas de rendimiento de Rootly
+# Script mejorado para ejecutar las pruebas de rendimiento de Rootly
 
 echo "=================================================="
-echo "   Rootly Performance Testing Suite"
+echo "   Rootly Performance Testing Suite (v2)"
 echo "=================================================="
 echo ""
+
+# Configurar variables de entorno para matplotlib
+export MPLBACKEND=Agg
+export DISPLAY=""
 
 # Verificar si Python está instalado
 if ! command -v python3 &> /dev/null; then
@@ -45,6 +49,14 @@ fi
 echo "Archivo de configuración: config.json"
 BASE_URL=$(python3 -c "import json; print(json.load(open('config.json'))['base_url'])")
 echo "URL Base: $BASE_URL"
+
+# Opciones adicionales
+echo ""
+echo "Opciones disponibles:"
+echo "1. Ejecutar pruebas normales"
+echo "2. Ejecutar pruebas sin gráficos (solo CSV)"
+echo ""
+read -p "Selecciona una opción (1-2): " -n 1 -r
 echo ""
 
 # Confirmar ejecución
@@ -62,34 +74,84 @@ echo "   Ejecutando Pruebas"
 echo "=================================================="
 echo ""
 
-# Ejecutar pruebas
+# Configurar timeout para evitar cuelgues
+TIMEOUT_SECONDS=3600  # 1 hora
+
+# Función para manejar timeout
+timeout_handler() {
+    echo ""
+    echo "ERROR: Las pruebas han excedido el tiempo límite de $TIMEOUT_SECONDS segundos"
+    echo "Terminando proceso..."
+    exit 124
+}
+
+# Configurar trap para timeout
+trap timeout_handler SIGALRM
+
+# Iniciar timeout
+(sleep $TIMEOUT_SECONDS && kill -ALRM $$) &
+TIMEOUT_PID=$!
+
+# Ejecutar pruebas con manejo de errores
+set -e
+trap 'echo ""; echo "ERROR: Las pruebas fallaron inesperadamente"; kill $TIMEOUT_PID 2>/dev/null; exit 1' ERR
+
+echo "Iniciando pruebas..."
+echo "PID del timeout: $TIMEOUT_PID"
+echo "Configuración matplotlib: MPLBACKEND=$MPLBACKEND"
+echo ""
+
+# Ejecutar el script principal
 python3 performance_test.py config.json
 
-# Verificar si la ejecución fue exitosa
-if [ $? -eq 0 ]; then
+# Si llegamos aquí, las pruebas fueron exitosas
+kill $TIMEOUT_PID 2>/dev/null || true
+
+echo ""
+echo "=================================================="
+echo "   Pruebas Completadas Exitosamente"
+echo "=================================================="
+echo ""
+
+# Encontrar el directorio de resultados más reciente
+RESULTS_DIR=$(ls -td results_* 2>/dev/null | head -1)
+
+if [ -n "$RESULTS_DIR" ]; then
+    echo "Resultados guardados en: $RESULTS_DIR"
     echo ""
-    echo "=================================================="
-    echo "   Pruebas Completadas Exitosamente"
-    echo "=================================================="
+    echo "Archivos generados:"
+    ls -la "$RESULTS_DIR"
     echo ""
     
-    # Encontrar el directorio de resultados más reciente
-    RESULTS_DIR=$(ls -td results_* 2>/dev/null | head -1)
+    # Verificar si se generaron gráficos
+    if ls "$RESULTS_DIR"/*.png 1> /dev/null 2>&1; then
+        echo "✓ Gráficos generados correctamente"
+    else
+        echo "⚠ No se generaron gráficos (solo datos CSV disponibles)"
+    fi
     
-    if [ -n "$RESULTS_DIR" ]; then
-        echo "Resultados guardados en: $RESULTS_DIR"
+    # Verificar si existe el reporte de resumen
+    if [ -f "$RESULTS_DIR/summary_report.txt" ]; then
+        echo "✓ Reporte de resumen disponible"
         echo ""
-        echo "Archivos generados:"
-        ls -lh "$RESULTS_DIR"
+        echo "Resumen de resultados:"
+        echo "======================================"
+        head -20 "$RESULTS_DIR/summary_report.txt"
         echo ""
-        echo "Tip: Abre las imágenes .png para ver las gráficas"
-        echo "Tip: Abre summary_report.txt para ver el resumen"
+        echo "Ver archivo completo: $RESULTS_DIR/summary_report.txt"
     fi
 else
-    echo ""
-    echo "ERROR durante la ejecución de las pruebas"
-    exit 1
+    echo "WARNING: No se encontraron directorios de resultados"
 fi
 
-# Desactivar entorno virtual
-deactivate
+echo ""
+echo "=================================================="
+echo "   Limpieza"
+echo "=================================================="
+echo ""
+
+# Limpiar procesos huérfanos de matplotlib si existen
+pkill -f "matplotlib" 2>/dev/null || true
+
+echo "Pruebas finalizadas exitosamente"
+echo ""

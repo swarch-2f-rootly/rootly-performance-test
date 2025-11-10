@@ -9,12 +9,35 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import numpy as np
 from dataclasses import dataclass, asdict
+# Set matplotlib backend before importing pyplot to avoid GUI issues
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend
 import matplotlib.pyplot as plt
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from queue import Queue
+import warnings
+warnings.filterwarnings('ignore')
+
+# Optional imports for advanced regression analysis
+try:
+    from scipy import stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("WARNING: scipy not available. Advanced statistical analysis will be limited.")
+
+try:
+    from sklearn.preprocessing import PolynomialFeatures
+    from sklearn.linear_model import LinearRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.metrics import r2_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("WARNING: sklearn not available. Polynomial regression analysis will be limited.")
 
 
 @dataclass
@@ -169,6 +192,10 @@ class PerformanceTester:
     """Main performance testing class"""
     
     def __init__(self, config: PerformanceTestConfig):
+        # Ensure matplotlib is properly configured
+        import matplotlib
+        matplotlib.use('Agg', force=True)
+        
         self.config = config
         self.test_start_time = datetime.now()
         self.output_dir = Path(f"results_{self.test_start_time.strftime('%Y%m%d_%H%M%S')}")
@@ -557,11 +584,12 @@ class PerformanceTester:
     
     def find_knee(self, metrics_list: List[TestMetrics]) -> Tuple[int, float]:
         """
-        Find the knee point in the performance curve using improved detection
-        Focuses on finding the point before system degradation/failure
+        Find the knee point in the performance curve
+        The knee is the last optimal point before errors start occurring (>0%)
+        If no errors are found, applies performance analysis to find the optimal point
         Returns: (optimal_users, knee_score)
         """
-        if len(metrics_list) < 3:
+        if len(metrics_list) < 2:
             return metrics_list[-1].num_users, 0.0
         
         users = np.array([m.num_users for m in metrics_list])
@@ -570,109 +598,243 @@ class PerformanceTester:
         error_rates = np.array([m.error_rate for m in metrics_list])
         throughput = np.array([m.throughput_rps for m in metrics_list])
         
-        # Strategy 1: Detect significant error rate increase
-        # Find first point where error rate exceeds 1% or starts increasing significantly
-        error_threshold_idx = None
-        for i in range(len(error_rates)):
-            if error_rates[i] > 1.0:  # 1% error threshold
-                error_threshold_idx = max(0, i - 1)
-                break
-            # Check for sudden error rate increase
-            if i > 0 and error_rates[i] > error_rates[i-1] * 2 and error_rates[i] > 0.5:
-                error_threshold_idx = max(0, i - 1)
+        # Primary Strategy: Find first point with errors (>0%) and go back one step
+        first_error_idx = None
+        for i, error_rate in enumerate(error_rates):
+            if error_rate > 0.0:  # Any error rate > 0%
+                first_error_idx = i
                 break
         
-        # Strategy 2: Detect exponential growth in response time
-        # Calculate rate of change in response time
-        response_growth_idx = None
-        if len(response_times) >= 3:
+        if first_error_idx is not None:
+            # Found errors - the knee is the point just before errors start
+            knee_idx = max(0, first_error_idx - 1)
+            confidence = 95.0  # High confidence when based on error detection
+            
+            print(f"  KNEE ANALYSIS: First errors detected at {users[first_error_idx]} users ({error_rates[first_error_idx]:.2f}%)")
+            print(f"  KNEE ANALYSIS: Selecting previous point at {users[knee_idx]} users as optimal")
+            
+            return metrics_list[knee_idx].num_users, confidence
+        
+        # Secondary Strategy: No errors found, analyze performance characteristics
+        # Focus on finding the sweet spot before performance starts degrading
+        print(f"  KNEE ANALYSIS: No errors detected, analyzing performance characteristics...")
+        
+        # Strategy 1: Detect efficiency breakdown (throughput per user degradation)
+        efficiency_knee_idx = None
+        if len(throughput) >= 3:
+            efficiency = throughput / users
+            
+            # Find peak efficiency in early measurements
+            peak_range_end = max(2, min(len(efficiency) // 2, 5))  # First half or first 5 points
+            peak_efficiency = np.max(efficiency[:peak_range_end])
+            peak_idx = np.argmax(efficiency[:peak_range_end])
+            
+            # Look for sustained efficiency drop (>20% from peak)
+            for i in range(peak_idx + 1, len(efficiency)):
+                if efficiency[i] < peak_efficiency * 0.8:  # 20% efficiency drop
+                    # Verify this is sustained (next point also shows degradation)
+                    if i < len(efficiency) - 1 and efficiency[i + 1] < peak_efficiency * 0.85:
+                        efficiency_knee_idx = max(0, i - 1)  # Point before degradation
+                        break
+                    elif i == len(efficiency) - 1:  # Last point
+                        efficiency_knee_idx = max(0, i - 1)
+                        break
+        
+        # Strategy 2: Detect response time acceleration
+        response_knee_idx = None
+        if len(response_times) >= 4:
+            # Calculate rate of increase in response time
             growth_rates = []
-            for i in range(2, len(response_times)):
+            for i in range(1, len(response_times)):
                 if response_times[i-1] > 0:
-                    # Calculate percentage growth
-                    growth = (response_times[i] - response_times[i-1]) / response_times[i-1] * 100
-                    growth_rates.append(growth)
+                    growth_rate = (response_times[i] - response_times[i-1]) / response_times[i-1]
+                    growth_rates.append(growth_rate)
                 else:
                     growth_rates.append(0)
             
-            # Find where growth rate becomes excessive (>50% increase)
-            for i, growth in enumerate(growth_rates):
-                if growth > 50:  # 50% increase in response time
-                    response_growth_idx = max(0, i + 1)  # i+2-1 to account for offset
-                    break
-        
-        # Strategy 3: Detect throughput plateau or degradation
-        throughput_plateau_idx = None
-        if len(throughput) >= 3:
-            max_throughput = max(throughput[:len(throughput)//2 + 1]) if len(throughput) > 2 else max(throughput)
+            # Find where growth rate becomes excessive (>25% per step)
+            baseline_growth = np.mean(growth_rates[:max(1, len(growth_rates)//3)])
             
-            for i in range(1, len(throughput)):
-                # Throughput stops growing or starts declining
-                if throughput[i] < max_throughput * 0.95:  # 5% drop from max
-                    throughput_plateau_idx = max(0, i - 1)
+            for i, growth in enumerate(growth_rates):
+                if growth > 0.25 and growth > baseline_growth * 3:  # Significant acceleration
+                    response_knee_idx = i  # Point before acceleration
                     break
-                max_throughput = max(max_throughput, throughput[i])
         
-        # Strategy 4: Calculate curvature in response time curve
-        curvature_idx = None
-        if len(response_times) >= 3:
-            # Normalize response times for curvature calculation
-            if response_times.max() > response_times.min():
-                norm_response = (response_times - response_times.min()) / (response_times.max() - response_times.min())
-                
-                # Calculate second derivative (curvature)
-                curvature = np.zeros(len(norm_response))
-                for i in range(1, len(norm_response) - 1):
-                    curvature[i] = abs(norm_response[i-1] - 2*norm_response[i] + norm_response[i+1])
-                
-                # Find the point with maximum curvature in the first 70% of data
-                # (to avoid selecting points too close to failure)
-                search_limit = max(3, int(len(curvature) * 0.7))
-                if search_limit < len(curvature):
-                    curvature_idx = np.argmax(curvature[:search_limit])
-                else:
-                    curvature_idx = np.argmax(curvature)
+        # Strategy 3: Detect throughput plateau or decline
+        throughput_knee_idx = None
+        if len(throughput) >= 3:
+            # Find peak throughput
+            peak_throughput = np.max(throughput)
+            peak_throughput_idx = np.argmax(throughput)
+            
+            # Look for throughput decline from peak
+            for i in range(peak_throughput_idx + 1, len(throughput)):
+                if throughput[i] < peak_throughput * 0.95:  # 5% decline from peak
+                    throughput_knee_idx = peak_throughput_idx
+                    break
         
-        # Strategy 5: P95 response time threshold
-        # Find where P95 exceeds acceptable limits (e.g., 2x average of first few tests)
-        p95_threshold_idx = None
+        # Strategy 4: P95 response time threshold
+        p95_knee_idx = None
         if len(p95_times) >= 3:
             baseline_p95 = np.mean(p95_times[:min(3, len(p95_times))])
-            for i in range(len(p95_times)):
-                if p95_times[i] > baseline_p95 * 3:  # 3x baseline
-                    p95_threshold_idx = max(0, i - 1)
+            
+            for i, p95 in enumerate(p95_times):
+                if p95 > baseline_p95 * 2.5:  # 2.5x baseline P95
+                    p95_knee_idx = max(0, i - 1)
                     break
         
-        # Combine strategies - choose the earliest warning sign
-        candidates = [
-            idx for idx in [
-                error_threshold_idx,
-                response_growth_idx,
-                throughput_plateau_idx,
-                p95_threshold_idx,
-                curvature_idx
-            ] if idx is not None
-        ]
+        # Combine strategies - prioritize efficiency and throughput indicators
+        candidates = []
+        
+        if efficiency_knee_idx is not None:
+            candidates.append(("efficiency", efficiency_knee_idx))
+            
+        if throughput_knee_idx is not None:
+            candidates.append(("throughput", throughput_knee_idx))
+            
+        if response_knee_idx is not None:
+            candidates.append(("response", response_knee_idx))
+            
+        if p95_knee_idx is not None:
+            candidates.append(("p95", p95_knee_idx))
         
         if candidates:
-            # Use the earliest indicator but verify it's reasonable
-            knee_idx = min(candidates)
+            # Log all candidates
+            for strategy, idx in candidates:
+                print(f"  KNEE ANALYSIS: {strategy} suggests {users[idx]} users")
             
-            # Sanity check: knee should not be at the very beginning or very end
-            if knee_idx == 0 and len(metrics_list) > 2:
-                knee_idx = 1
-            if knee_idx >= len(metrics_list) - 1 and len(metrics_list) > 2:
-                knee_idx = len(metrics_list) - 2
+            # Prioritize efficiency and throughput over response time metrics
+            priority_candidates = [idx for strategy, idx in candidates if strategy in ["efficiency", "throughput"]]
+            
+            if priority_candidates:
+                knee_idx = min(priority_candidates)  # Most conservative from high-priority strategies
+                confidence = 70.0
+            else:
+                knee_idx = min([idx for _, idx in candidates])  # Most conservative overall
+                confidence = 50.0
+                
         else:
-            # Fallback to middle point if no clear indicators
-            knee_idx = len(metrics_list) // 2
+            # Fallback: Use point with best efficiency in first 60% of tests
+            search_range = max(2, int(len(metrics_list) * 0.6))
+            efficiency = throughput[:search_range] / users[:search_range]
+            knee_idx = np.argmax(efficiency)
+            confidence = 30.0
+            print(f"  KNEE ANALYSIS: Fallback - using peak efficiency point")
         
-        # Calculate a score based on how many strategies agreed
-        score = len([idx for idx in [error_threshold_idx, response_growth_idx, 
-                                      throughput_plateau_idx, p95_threshold_idx] 
-                     if idx is not None and abs(idx - knee_idx) <= 1])
+        # Ensure reasonable bounds
+        knee_idx = max(0, min(knee_idx, len(metrics_list) - 1))
         
-        return metrics_list[knee_idx].num_users, float(score)
+        print(f"  KNEE ANALYSIS: Selected {users[knee_idx]} users (confidence: {confidence:.0f}%)")
+        
+        return metrics_list[knee_idx].num_users, confidence
+    
+    def detect_anomalies_with_regression(self, x_data: np.ndarray, y_data: np.ndarray, 
+                                        data_name: str = "data") -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Detect anomalies using regression analysis
+        Returns: (predicted_values, anomaly_mask, regression_info)
+        """
+        regression_info = {
+            'r2_score': 0.0,
+            'regression_type': 'none',
+            'anomaly_threshold': 0.0,
+            'anomalies_detected': 0
+        }
+        
+        if len(x_data) < 3:
+            return np.zeros_like(y_data), np.zeros(len(y_data), dtype=bool), regression_info
+        
+        # Try different regression models
+        best_predictions = None
+        best_r2 = -1
+        best_type = 'none'
+        
+        # 1. Linear regression (built-in numpy)
+        try:
+            # Linear fit using numpy polyfit
+            linear_coeffs = np.polyfit(x_data, y_data, 1)
+            linear_predictions = np.polyval(linear_coeffs, x_data)
+            linear_r2 = 1 - (np.sum((y_data - linear_predictions) ** 2) / 
+                             np.sum((y_data - np.mean(y_data)) ** 2))
+            
+            if linear_r2 > best_r2:
+                best_predictions = linear_predictions
+                best_r2 = linear_r2
+                best_type = 'linear'
+                
+        except Exception as e:
+            print(f"    Warning: Linear regression failed for {data_name}: {e}")
+        
+        # 2. Polynomial regression (degree 2) using numpy
+        if len(x_data) >= 4:
+            try:
+                poly_coeffs = np.polyfit(x_data, y_data, 2)
+                poly_predictions = np.polyval(poly_coeffs, x_data)
+                poly_r2 = 1 - (np.sum((y_data - poly_predictions) ** 2) / 
+                              np.sum((y_data - np.mean(y_data)) ** 2))
+                
+                if poly_r2 > best_r2:
+                    best_predictions = poly_predictions
+                    best_r2 = poly_r2
+                    best_type = 'polynomial_2'
+                    
+            except Exception as e:
+                print(f"    Warning: Polynomial regression failed for {data_name}: {e}")
+        
+        # 3. Advanced sklearn regression (if available)
+        if SKLEARN_AVAILABLE and len(x_data) >= 5:
+            try:
+                X = x_data.reshape(-1, 1)
+                
+                # Try polynomial regression with different degrees
+                for degree in [2, 3]:
+                    if len(x_data) >= degree + 2:
+                        poly_reg = Pipeline([
+                            ('poly', PolynomialFeatures(degree=degree)),
+                            ('linear', LinearRegression())
+                        ])
+                        poly_reg.fit(X, y_data)
+                        sklearn_predictions = poly_reg.predict(X)
+                        sklearn_r2 = r2_score(y_data, sklearn_predictions)
+                        
+                        if sklearn_r2 > best_r2:
+                            best_predictions = sklearn_predictions
+                            best_r2 = sklearn_r2
+                            best_type = f'sklearn_poly_{degree}'
+                            
+            except Exception as e:
+                print(f"    Warning: sklearn regression failed for {data_name}: {e}")
+        
+        # Use best regression or fallback to mean
+        if best_predictions is None:
+            best_predictions = np.full_like(y_data, np.mean(y_data))
+            best_r2 = 0.0
+            best_type = 'mean_fallback'
+        
+        # Calculate residuals and detect anomalies
+        residuals = np.abs(y_data - best_predictions)
+        
+        # Anomaly detection using statistical thresholds
+        if SCIPY_AVAILABLE:
+            # Use Z-score method with scipy
+            z_scores = np.abs(stats.zscore(residuals))
+            anomaly_mask = z_scores > 2.0  # 2 standard deviations
+            threshold = 2.0
+        else:
+            # Simple threshold using standard deviation
+            mean_residual = np.mean(residuals)
+            std_residual = np.std(residuals)
+            threshold = mean_residual + 2 * std_residual
+            anomaly_mask = residuals > threshold
+        
+        regression_info.update({
+            'r2_score': best_r2,
+            'regression_type': best_type,
+            'anomaly_threshold': threshold,
+            'anomalies_detected': np.sum(anomaly_mask)
+        })
+        
+        return best_predictions, anomaly_mask, regression_info
     
     def save_results_csv(self, metrics_list: List[TestMetrics], endpoint_name: str):
         """Save metrics to CSV file"""
@@ -689,90 +851,236 @@ class PerformanceTester:
         print(f"  Results saved to: {csv_file}")
     
     def generate_plots(self, metrics_list: List[TestMetrics], endpoint_name: str, knee_users: int):
-        """Generate performance plots"""
+        """Generate performance plots with regression analysis and anomaly detection"""
         if not metrics_list:
             return
         
-        users = [m.num_users for m in metrics_list]
-        avg_response = [m.avg_response_time_ms for m in metrics_list]
-        p95_response = [m.p95_response_time_ms for m in metrics_list]
-        p99_response = [m.p99_response_time_ms for m in metrics_list]
-        error_rates = [m.error_rate for m in metrics_list]
-        throughput = [m.throughput_rps for m in metrics_list]
+        # Ensure matplotlib is using Agg backend (thread-safe, no GUI)
+        import matplotlib
+        matplotlib.use('Agg', force=True)
+        
+        # Also set it not to use threading for backend initialization
+        import matplotlib.pyplot as plt
+        plt.ioff()  # Turn off interactive mode
+        
+        users = np.array([m.num_users for m in metrics_list])
+        avg_response = np.array([m.avg_response_time_ms for m in metrics_list])
+        p95_response = np.array([m.p95_response_time_ms for m in metrics_list])
+        p99_response = np.array([m.p99_response_time_ms for m in metrics_list])
+        error_rates = np.array([m.error_rate for m in metrics_list])
+        throughput = np.array([m.throughput_rps for m in metrics_list])
+        
+        # Perform regression analysis on key metrics
+        print(f"  Performing regression analysis for anomaly detection...")
+        
+        response_pred, response_anomalies, response_reg_info = self.detect_anomalies_with_regression(
+            users, avg_response, "average response time"
+        )
+        throughput_pred, throughput_anomalies, throughput_reg_info = self.detect_anomalies_with_regression(
+            users, throughput, "throughput"
+        )
+        p95_pred, p95_anomalies, p95_reg_info = self.detect_anomalies_with_regression(
+            users, p95_response, "P95 response time"
+        )
+        
+        # Print regression analysis results
+        print(f"    Response Time Regression - R²: {response_reg_info['r2_score']:.3f}, "
+              f"Type: {response_reg_info['regression_type']}, "
+              f"Anomalies: {response_reg_info['anomalies_detected']}")
+        print(f"    Throughput Regression - R²: {throughput_reg_info['r2_score']:.3f}, "
+              f"Type: {throughput_reg_info['regression_type']}, "
+              f"Anomalies: {throughput_reg_info['anomalies_detected']}")
+        print(f"    P95 Regression - R²: {p95_reg_info['r2_score']:.3f}, "
+              f"Type: {p95_reg_info['regression_type']}, "
+              f"Anomalies: {p95_reg_info['anomalies_detected']}")
         
         # Create figure with subplots
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f'Performance Analysis - {endpoint_name}', fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+        fig.suptitle(f'Performance Analysis with Regression - {endpoint_name}', fontsize=16, fontweight='bold')
         
-        # 1. Response Time vs Users
+        # 1. Response Time vs Users with Regression
         ax1 = axes[0, 0]
-        ax1.plot(users, avg_response, 'b-o', label='Average', linewidth=2, markersize=4)
+        ax1.plot(users, avg_response, 'b-o', label='Average Response', linewidth=2, markersize=4)
+        ax1.plot(users, response_pred, 'r--', label=f'Regression ({response_reg_info["regression_type"]})', linewidth=2)
         ax1.plot(users, p95_response, 'g--s', label='P95', linewidth=1.5, markersize=3)
-        ax1.plot(users, p99_response, 'r--^', label='P99', linewidth=1.5, markersize=3)
-        ax1.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
+        ax1.plot(users, p99_response, 'orange', linestyle=':', label='P99', linewidth=1.5, marker='^', markersize=3)
+        
+        # Highlight anomalies
+        if np.any(response_anomalies):
+            ax1.scatter(users[response_anomalies], avg_response[response_anomalies], 
+                       c='red', s=100, marker='x', linewidth=3, label='Anomalies', zorder=5)
+        
+        ax1.axvline(x=knee_users, color='purple', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
         ax1.set_xlabel('Concurrent Users')
         ax1.set_ylabel('Response Time (ms)')
-        ax1.set_title('Response Time vs Concurrent Users')
-        ax1.legend(loc='best')
+        ax1.set_title(f'Response Time Analysis (R² = {response_reg_info["r2_score"]:.3f})')
+        ax1.legend(loc='best', fontsize=9)
         ax1.grid(True, alpha=0.3)
         ax1.set_xlim(left=0, right=max(users) * 1.05)
         ax1.set_ylim(bottom=0)
         
         # 2. Error Rate vs Users
         ax2 = axes[0, 1]
-        ax2.plot(users, error_rates, 'r-o', linewidth=2, markersize=4)
-        ax2.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
+        ax2.plot(users, error_rates, 'r-o', linewidth=2, markersize=4, label='Error Rate')
+        ax2.axvline(x=knee_users, color='purple', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
         ax2.axhline(y=5.0, color='red', linestyle=':', linewidth=1, label='5% threshold')
+        ax2.axhline(y=1.0, color='orange', linestyle=':', linewidth=1, label='1% threshold')
+        
+        # Highlight first error occurrence
+        first_error_idx = np.where(error_rates > 0)[0]
+        if len(first_error_idx) > 0:
+            first_error = first_error_idx[0]
+            ax2.scatter(users[first_error], error_rates[first_error], 
+                       c='red', s=150, marker='*', linewidth=2, label='First Error', zorder=5)
+        
         ax2.set_xlabel('Concurrent Users')
         ax2.set_ylabel('Error Rate (%)')
         ax2.set_title('Error Rate vs Concurrent Users')
-        ax2.legend(loc='best')
+        ax2.legend(loc='best', fontsize=9)
         ax2.grid(True, alpha=0.3)
         ax2.set_xlim(left=0, right=max(users) * 1.05)
         ax2.set_ylim(bottom=0)
         
-        # 3. Throughput vs Users
-        ax3 = axes[1, 0]
-        ax3.plot(users, throughput, 'g-o', linewidth=2, markersize=4)
-        ax3.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
+        # 3. Throughput vs Users with Regression
+        ax3 = axes[0, 2]
+        ax3.plot(users, throughput, 'g-o', label='Throughput', linewidth=2, markersize=4)
+        ax3.plot(users, throughput_pred, 'r--', label=f'Regression ({throughput_reg_info["regression_type"]})', linewidth=2)
+        
+        # Highlight anomalies
+        if np.any(throughput_anomalies):
+            ax3.scatter(users[throughput_anomalies], throughput[throughput_anomalies], 
+                       c='red', s=100, marker='x', linewidth=3, label='Anomalies', zorder=5)
+        
+        ax3.axvline(x=knee_users, color='purple', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
         ax3.set_xlabel('Concurrent Users')
         ax3.set_ylabel('Throughput (req/s)')
-        ax3.set_title('Throughput vs Concurrent Users')
-        ax3.legend(loc='best')
+        ax3.set_title(f'Throughput Analysis (R² = {throughput_reg_info["r2_score"]:.3f})')
+        ax3.legend(loc='best', fontsize=9)
         ax3.grid(True, alpha=0.3)
         ax3.set_xlim(left=0, right=max(users) * 1.05)
         ax3.set_ylim(bottom=0)
         
-        # 4. Performance Curve (Combined)
-        ax4 = axes[1, 1]
+        # 4. Efficiency Analysis (Throughput/Users)
+        ax4 = axes[1, 0]
+        efficiency = throughput / users
+        ax4.plot(users, efficiency, 'purple', marker='o', label='Efficiency (req/s per user)', linewidth=2, markersize=4)
         
-        # Normalize for comparison
+        # Calculate efficiency regression
+        eff_pred, eff_anomalies, eff_reg_info = self.detect_anomalies_with_regression(
+            users, efficiency, "efficiency"
+        )
+        ax4.plot(users, eff_pred, 'r--', label=f'Efficiency Trend (R² = {eff_reg_info["r2_score"]:.3f})', linewidth=2)
+        
+        # Highlight efficiency anomalies
+        if np.any(eff_anomalies):
+            ax4.scatter(users[eff_anomalies], efficiency[eff_anomalies], 
+                       c='red', s=100, marker='x', linewidth=3, label='Anomalies', zorder=5)
+        
+        ax4.axvline(x=knee_users, color='purple', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
+        ax4.set_xlabel('Concurrent Users')
+        ax4.set_ylabel('Efficiency (req/s per user)')
+        ax4.set_title('Scaling Efficiency Analysis')
+        ax4.legend(loc='best', fontsize=9)
+        ax4.grid(True, alpha=0.3)
+        ax4.set_xlim(left=0, right=max(users) * 1.05)
+        ax4.set_ylim(bottom=0)
+        
+        # 5. P95 Response Time Analysis
+        ax5 = axes[1, 1]
+        ax5.plot(users, p95_response, 'orange', marker='s', label='P95 Response Time', linewidth=2, markersize=4)
+        ax5.plot(users, p95_pred, 'r--', label=f'P95 Regression ({p95_reg_info["regression_type"]})', linewidth=2)
+        
+        # Highlight P95 anomalies
+        if np.any(p95_anomalies):
+            ax5.scatter(users[p95_anomalies], p95_response[p95_anomalies], 
+                       c='red', s=100, marker='x', linewidth=3, label='Anomalies', zorder=5)
+        
+        ax5.axvline(x=knee_users, color='purple', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
+        ax5.set_xlabel('Concurrent Users')
+        ax5.set_ylabel('P95 Response Time (ms)')
+        ax5.set_title(f'P95 Response Time Analysis (R² = {p95_reg_info["r2_score"]:.3f})')
+        ax5.legend(loc='best', fontsize=9)
+        ax5.grid(True, alpha=0.3)
+        ax5.set_xlim(left=0, right=max(users) * 1.05)
+        ax5.set_ylim(bottom=0)
+        
+        # 6. Combined Performance Score
+        ax6 = axes[1, 2]
+        
+        # Calculate normalized performance score (lower is better for response time, higher is better for throughput)
         max_response = max(avg_response) if max(avg_response) > 0 else 1
         max_throughput = max(throughput) if max(throughput) > 0 else 1
         
-        norm_response = [r / max_response * 100 for r in avg_response]
-        norm_throughput = [t / max_throughput * 100 for t in throughput]
+        norm_response = avg_response / max_response  # 0-1, lower is better
+        norm_throughput = throughput / max_throughput  # 0-1, higher is better
+        norm_errors = error_rates / 100.0 if max(error_rates) > 0 else np.zeros_like(error_rates)  # 0-1, lower is better
         
-        ax4.plot(users, norm_response, 'b-o', label='Response Time (normalized)', linewidth=2, markersize=4)
-        ax4.plot(users, norm_throughput, 'g-s', label='Throughput (normalized)', linewidth=2, markersize=4)
-        ax4.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
-        ax4.set_xlabel('Concurrent Users')
-        ax4.set_ylabel('Normalized Value (%)')
-        ax4.set_title('Performance Curve (Normalized)')
-        ax4.legend(loc='best')
-        ax4.grid(True, alpha=0.3)
-        ax4.set_xlim(left=0, right=max(users) * 1.05)
-        ax4.set_ylim(bottom=0, top=105)
+        # Performance score: higher throughput, lower response time, lower errors
+        performance_score = (norm_throughput * 0.4) + ((1 - norm_response) * 0.4) + ((1 - norm_errors) * 0.2)
+        
+        ax6.plot(users, performance_score * 100, 'navy', marker='d', label='Performance Score', linewidth=2, markersize=4)
+        ax6.axvline(x=knee_users, color='purple', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
+        
+        # Find and highlight peak performance
+        peak_score_idx = np.argmax(performance_score)
+        ax6.scatter(users[peak_score_idx], performance_score[peak_score_idx] * 100, 
+                   c='gold', s=150, marker='*', linewidth=2, label=f'Peak Performance ({users[peak_score_idx]} users)', zorder=5)
+        
+        ax6.set_xlabel('Concurrent Users')
+        ax6.set_ylabel('Performance Score (%)')
+        ax6.set_title('Combined Performance Score')
+        ax6.legend(loc='best', fontsize=9)
+        ax6.grid(True, alpha=0.3)
+        ax6.set_xlim(left=0, right=max(users) * 1.05)
+        ax6.set_ylim(bottom=0, top=105)
         
         plt.tight_layout()
         
         # Save plot
         timestamp = self.test_start_time.strftime('%Y%m%d_%H%M%S')
         plot_file = self.output_dir / f"{endpoint_name}_performance_{timestamp}.png"
-        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-        plt.close()
         
-        print(f"  Plots saved to: {plot_file}")
+        try:
+            plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+            print(f"  Plots with regression analysis saved to: {plot_file}")
+            
+            # Save anomaly summary
+            anomaly_summary_file = self.output_dir / f"{endpoint_name}_anomalies_{timestamp}.txt"
+            with open(anomaly_summary_file, 'w') as f:
+                f.write(f"Anomaly Detection Results for {endpoint_name}\n")
+                f.write("="*50 + "\n\n")
+                
+                f.write("Regression Analysis Results:\n")
+                f.write(f"Response Time: R² = {response_reg_info['r2_score']:.4f}, Type = {response_reg_info['regression_type']}\n")
+                f.write(f"Throughput: R² = {throughput_reg_info['r2_score']:.4f}, Type = {throughput_reg_info['regression_type']}\n")
+                f.write(f"P95 Response: R² = {p95_reg_info['r2_score']:.4f}, Type = {p95_reg_info['regression_type']}\n")
+                f.write(f"Efficiency: R² = {eff_reg_info['r2_score']:.4f}, Type = {eff_reg_info['regression_type']}\n\n")
+                
+                f.write("Detected Anomalies:\n")
+                if np.any(response_anomalies):
+                    f.write(f"Response Time Anomalies at users: {users[response_anomalies].tolist()}\n")
+                if np.any(throughput_anomalies):
+                    f.write(f"Throughput Anomalies at users: {users[throughput_anomalies].tolist()}\n")
+                if np.any(p95_anomalies):
+                    f.write(f"P95 Response Anomalies at users: {users[p95_anomalies].tolist()}\n")
+                if np.any(eff_anomalies):
+                    f.write(f"Efficiency Anomalies at users: {users[eff_anomalies].tolist()}\n")
+                
+                if not any([np.any(response_anomalies), np.any(throughput_anomalies), 
+                           np.any(p95_anomalies), np.any(eff_anomalies)]):
+                    f.write("No significant anomalies detected.\n")
+                
+                f.write(f"\nPeak Performance: {users[peak_score_idx]} users (Score: {performance_score[peak_score_idx]*100:.2f}%)\n")
+                f.write(f"Knee Point: {knee_users} users\n")
+            
+            print(f"  Anomaly analysis saved to: {anomaly_summary_file}")
+            
+        except Exception as e:
+            print(f"  WARNING: Could not save plot: {e}")
+        finally:
+            # Properly close the figure to free memory
+            plt.close(fig)
+            plt.close('all')  # Close any remaining figures
     
     async def test_endpoint(self, endpoint: Dict[str, Any]):
         """Test a single endpoint across all user counts"""
@@ -894,7 +1202,13 @@ class PerformanceTester:
         
         # Save results
         self.save_results_csv(metrics_list, endpoint_name)
-        self.generate_plots(metrics_list, endpoint_name, knee_users)
+        
+        # Generate plots with error handling
+        try:
+            self.generate_plots(metrics_list, endpoint_name, knee_users)
+        except Exception as e:
+            print(f"  WARNING: Could not generate plots for {endpoint_name}: {e}")
+            print(f"  CSV data is still available for manual analysis")
         
         return metrics_list, knee_users
     
@@ -985,8 +1299,26 @@ class PerformanceTester:
         print(f"\n  Summary report saved to: {summary_file}")
 
 
+def setup_matplotlib():
+    """Configure matplotlib for headless operation"""
+    import matplotlib
+    # Force Agg backend to prevent GUI issues
+    matplotlib.use('Agg', force=True)
+    
+    # Disable interactive mode
+    import matplotlib.pyplot as plt
+    plt.ioff()
+    
+    # Set thread safety
+    import os
+    os.environ['MPLBACKEND'] = 'Agg'
+
+
 def main():
     """Main entry point"""
+    # Configure matplotlib for headless operation
+    setup_matplotlib()
+    
     # Check for config file argument
     config_file = sys.argv[1] if len(sys.argv) > 1 else None
     
