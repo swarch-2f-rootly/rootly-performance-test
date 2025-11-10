@@ -60,20 +60,35 @@ class PerformanceTestConfig:
                 self.__dict__.update(config_data)
         else:
             # Default configuration
-            self.base_url = "http://192.168.1.100"  # Machine A IP
+            self.base_url = "http://127.0.0.1"
             self.auth_token = None
             self.auth_credentials = {
-                "email": "Admin@rootly.com",
+                "email": "admin@rootly.com",
                 "password": "Admin123!",
-                "login_endpoint": "/api/auth/login",
-                "login_port": 8000
+                "login_endpoint": "/api/v1/auth/login",
+                "login_port": 8080
             }
             self.timeout_seconds = 30
             
-            # Test progression
-            self.user_counts = [1, 5, 10, 25, 50, 100, 200, 500, 1000, 1500, 2000]
+            # Test progression - can be defined by range or explicit list
+            self.min_users = 1
+            self.max_users = 3000
+            self.user_step = 50  # Increment between tests
+            # Alternative: explicit list (if user_counts is defined, it takes precedence)
+            # self.user_counts = [1, 5, 10, 25, 50, 100, 200, 500, 1000]
+            
             self.ramp_up_period_s = 1  # Time to spawn all users
             self.requests_per_user = 1
+            
+            # Cooldown periods for system recovery
+            self.cooldown_between_tests_s = 0  # Cooldown after each test iteration
+            self.tests_per_set = 10  # Number of tests before a longer cooldown
+            self.cooldown_between_sets_s = 5  # Longer cooldown after a set of tests
+            
+            # Auto failure point detection
+            self.auto_find_failure_point = True  # Continue testing until failure threshold
+            self.failure_threshold_percent = 50  # Error rate to reach
+            self.max_auto_users = 10000  # Maximum users when auto-finding failure point
             
             # Threading options
             self.use_threads = True  # Use threads for concurrent requests
@@ -84,22 +99,22 @@ class PerformanceTestConfig:
                 {
                     "name": "data_ingestion",
                     "method": "POST",
-                    "path": "/measurements",
-                    "port": 8080,
+                    "path": "/ingest",
+                    "port": 8005,
                     "headers": {"Content-Type": "application/json"},
                     "body": {
-                        "deviceId": "sensor-001",
-                        "temperature": 25.5,
-                        "humidity": 60.0,
-                        "soilMoisture": 45.0,
-                        "timestamp": None  # Will be set dynamically
+                        "id_controller": "FARM-001",
+                        "soil_humidity": 45.5,
+                        "air_humidity": 62.3,
+                        "temperature": 24.8,
+                        "light_intensity": 15000.0
                     }
                 },
                 {
                     "name": "graphql_analytics",
                     "method": "POST",
                     "path": "/api/v1/graphql",
-                    "port": 8081,
+                    "port": 8080,
                     "headers": {"Content-Type": "application/json"},
                     "body": {
                         "query": """
@@ -124,6 +139,30 @@ class PerformanceTestConfig:
         """Save current configuration to file"""
         with open(filepath, 'w') as f:
             json.dump(self.__dict__, f, indent=2)
+    
+    def get_user_counts(self) -> List[int]:
+        """Get the list of user counts to test"""
+        # If explicit user_counts is defined, use it
+        if hasattr(self, 'user_counts') and self.user_counts:
+            return self.user_counts
+        
+        # Otherwise, generate from min_users, max_users, and user_step
+        min_users = getattr(self, 'min_users', 1)
+        max_users = getattr(self, 'max_users', 1000)
+        user_step = getattr(self, 'user_step', 50)
+        
+        # Generate range: min_users, min_users+step, ..., up to max_users
+        user_counts = list(range(min_users, max_users + 1, user_step))
+        
+        # Ensure we always test with 1 user if min_users > 1
+        if min_users > 1 and 1 not in user_counts:
+            user_counts.insert(0, 1)
+        
+        # Ensure max_users is included if not already
+        if max_users not in user_counts:
+            user_counts.append(max_users)
+        
+        return sorted(user_counts)
 
 
 class PerformanceTester:
@@ -518,7 +557,8 @@ class PerformanceTester:
     
     def find_knee(self, metrics_list: List[TestMetrics]) -> Tuple[int, float]:
         """
-        Find the knee point in the performance curve using the "elbow method"
+        Find the knee point in the performance curve using improved detection
+        Focuses on finding the point before system degradation/failure
         Returns: (optimal_users, knee_score)
         """
         if len(metrics_list) < 3:
@@ -526,35 +566,113 @@ class PerformanceTester:
         
         users = np.array([m.num_users for m in metrics_list])
         response_times = np.array([m.avg_response_time_ms for m in metrics_list])
+        p95_times = np.array([m.p95_response_time_ms for m in metrics_list])
         error_rates = np.array([m.error_rate for m in metrics_list])
+        throughput = np.array([m.throughput_rps for m in metrics_list])
         
-        # Normalize data
-        users_norm = (users - users.min()) / (users.max() - users.min())
-        response_norm = (response_times - response_times.min()) / (response_times.max() - response_times.min() + 1e-10)
+        # Strategy 1: Detect significant error rate increase
+        # Find first point where error rate exceeds 1% or starts increasing significantly
+        error_threshold_idx = None
+        for i in range(len(error_rates)):
+            if error_rates[i] > 1.0:  # 1% error threshold
+                error_threshold_idx = max(0, i - 1)
+                break
+            # Check for sudden error rate increase
+            if i > 0 and error_rates[i] > error_rates[i-1] * 2 and error_rates[i] > 0.5:
+                error_threshold_idx = max(0, i - 1)
+                break
         
-        # Calculate distance from ideal point (0 users, 0 response time)
-        # Using weighted combination of response time and error rate
-        scores = response_norm + (error_rates / 100) * 2  # Weight errors more
-        
-        # Find point with maximum curvature
-        # Using second derivative approximation
-        if len(scores) >= 3:
-            curvature = np.zeros(len(scores))
-            for i in range(1, len(scores) - 1):
-                curvature[i] = abs(scores[i-1] - 2*scores[i] + scores[i+1])
+        # Strategy 2: Detect exponential growth in response time
+        # Calculate rate of change in response time
+        response_growth_idx = None
+        if len(response_times) >= 3:
+            growth_rates = []
+            for i in range(2, len(response_times)):
+                if response_times[i-1] > 0:
+                    # Calculate percentage growth
+                    growth = (response_times[i] - response_times[i-1]) / response_times[i-1] * 100
+                    growth_rates.append(growth)
+                else:
+                    growth_rates.append(0)
             
-            knee_idx = np.argmax(curvature)
-        else:
-            # Fallback: find where error rate starts increasing significantly
-            knee_idx = 0
-            for i, m in enumerate(metrics_list):
-                if m.error_rate > 5.0:  # 5% error threshold
-                    knee_idx = max(0, i - 1)
+            # Find where growth rate becomes excessive (>50% increase)
+            for i, growth in enumerate(growth_rates):
+                if growth > 50:  # 50% increase in response time
+                    response_growth_idx = max(0, i + 1)  # i+2-1 to account for offset
                     break
-            else:
-                knee_idx = len(metrics_list) - 1
         
-        return metrics_list[knee_idx].num_users, scores[knee_idx]
+        # Strategy 3: Detect throughput plateau or degradation
+        throughput_plateau_idx = None
+        if len(throughput) >= 3:
+            max_throughput = max(throughput[:len(throughput)//2 + 1]) if len(throughput) > 2 else max(throughput)
+            
+            for i in range(1, len(throughput)):
+                # Throughput stops growing or starts declining
+                if throughput[i] < max_throughput * 0.95:  # 5% drop from max
+                    throughput_plateau_idx = max(0, i - 1)
+                    break
+                max_throughput = max(max_throughput, throughput[i])
+        
+        # Strategy 4: Calculate curvature in response time curve
+        curvature_idx = None
+        if len(response_times) >= 3:
+            # Normalize response times for curvature calculation
+            if response_times.max() > response_times.min():
+                norm_response = (response_times - response_times.min()) / (response_times.max() - response_times.min())
+                
+                # Calculate second derivative (curvature)
+                curvature = np.zeros(len(norm_response))
+                for i in range(1, len(norm_response) - 1):
+                    curvature[i] = abs(norm_response[i-1] - 2*norm_response[i] + norm_response[i+1])
+                
+                # Find the point with maximum curvature in the first 70% of data
+                # (to avoid selecting points too close to failure)
+                search_limit = max(3, int(len(curvature) * 0.7))
+                if search_limit < len(curvature):
+                    curvature_idx = np.argmax(curvature[:search_limit])
+                else:
+                    curvature_idx = np.argmax(curvature)
+        
+        # Strategy 5: P95 response time threshold
+        # Find where P95 exceeds acceptable limits (e.g., 2x average of first few tests)
+        p95_threshold_idx = None
+        if len(p95_times) >= 3:
+            baseline_p95 = np.mean(p95_times[:min(3, len(p95_times))])
+            for i in range(len(p95_times)):
+                if p95_times[i] > baseline_p95 * 3:  # 3x baseline
+                    p95_threshold_idx = max(0, i - 1)
+                    break
+        
+        # Combine strategies - choose the earliest warning sign
+        candidates = [
+            idx for idx in [
+                error_threshold_idx,
+                response_growth_idx,
+                throughput_plateau_idx,
+                p95_threshold_idx,
+                curvature_idx
+            ] if idx is not None
+        ]
+        
+        if candidates:
+            # Use the earliest indicator but verify it's reasonable
+            knee_idx = min(candidates)
+            
+            # Sanity check: knee should not be at the very beginning or very end
+            if knee_idx == 0 and len(metrics_list) > 2:
+                knee_idx = 1
+            if knee_idx >= len(metrics_list) - 1 and len(metrics_list) > 2:
+                knee_idx = len(metrics_list) - 2
+        else:
+            # Fallback to middle point if no clear indicators
+            knee_idx = len(metrics_list) // 2
+        
+        # Calculate a score based on how many strategies agreed
+        score = len([idx for idx in [error_threshold_idx, response_growth_idx, 
+                                      throughput_plateau_idx, p95_threshold_idx] 
+                     if idx is not None and abs(idx - knee_idx) <= 1])
+        
+        return metrics_list[knee_idx].num_users, float(score)
     
     def save_results_csv(self, metrics_list: List[TestMetrics], endpoint_name: str):
         """Save metrics to CSV file"""
@@ -588,36 +706,42 @@ class PerformanceTester:
         
         # 1. Response Time vs Users
         ax1 = axes[0, 0]
-        ax1.plot(users, avg_response, 'b-o', label='Average', linewidth=2)
-        ax1.plot(users, p95_response, 'g--s', label='P95', linewidth=1.5)
-        ax1.plot(users, p99_response, 'r--^', label='P99', linewidth=1.5)
+        ax1.plot(users, avg_response, 'b-o', label='Average', linewidth=2, markersize=4)
+        ax1.plot(users, p95_response, 'g--s', label='P95', linewidth=1.5, markersize=3)
+        ax1.plot(users, p99_response, 'r--^', label='P99', linewidth=1.5, markersize=3)
         ax1.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
         ax1.set_xlabel('Concurrent Users')
         ax1.set_ylabel('Response Time (ms)')
         ax1.set_title('Response Time vs Concurrent Users')
-        ax1.legend()
+        ax1.legend(loc='best')
         ax1.grid(True, alpha=0.3)
+        ax1.set_xlim(left=0, right=max(users) * 1.05)
+        ax1.set_ylim(bottom=0)
         
         # 2. Error Rate vs Users
         ax2 = axes[0, 1]
-        ax2.plot(users, error_rates, 'r-o', linewidth=2)
+        ax2.plot(users, error_rates, 'r-o', linewidth=2, markersize=4)
         ax2.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
         ax2.axhline(y=5.0, color='red', linestyle=':', linewidth=1, label='5% threshold')
         ax2.set_xlabel('Concurrent Users')
         ax2.set_ylabel('Error Rate (%)')
         ax2.set_title('Error Rate vs Concurrent Users')
-        ax2.legend()
+        ax2.legend(loc='best')
         ax2.grid(True, alpha=0.3)
+        ax2.set_xlim(left=0, right=max(users) * 1.05)
+        ax2.set_ylim(bottom=0)
         
         # 3. Throughput vs Users
         ax3 = axes[1, 0]
-        ax3.plot(users, throughput, 'g-o', linewidth=2)
+        ax3.plot(users, throughput, 'g-o', linewidth=2, markersize=4)
         ax3.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
         ax3.set_xlabel('Concurrent Users')
         ax3.set_ylabel('Throughput (req/s)')
         ax3.set_title('Throughput vs Concurrent Users')
-        ax3.legend()
+        ax3.legend(loc='best')
         ax3.grid(True, alpha=0.3)
+        ax3.set_xlim(left=0, right=max(users) * 1.05)
+        ax3.set_ylim(bottom=0)
         
         # 4. Performance Curve (Combined)
         ax4 = axes[1, 1]
@@ -629,14 +753,16 @@ class PerformanceTester:
         norm_response = [r / max_response * 100 for r in avg_response]
         norm_throughput = [t / max_throughput * 100 for t in throughput]
         
-        ax4.plot(users, norm_response, 'b-o', label='Response Time (normalized)', linewidth=2)
-        ax4.plot(users, norm_throughput, 'g-s', label='Throughput (normalized)', linewidth=2)
+        ax4.plot(users, norm_response, 'b-o', label='Response Time (normalized)', linewidth=2, markersize=4)
+        ax4.plot(users, norm_throughput, 'g-s', label='Throughput (normalized)', linewidth=2, markersize=4)
         ax4.axvline(x=knee_users, color='orange', linestyle='--', linewidth=2, label=f'Knee ({knee_users} users)')
         ax4.set_xlabel('Concurrent Users')
         ax4.set_ylabel('Normalized Value (%)')
         ax4.set_title('Performance Curve (Normalized)')
-        ax4.legend()
+        ax4.legend(loc='best')
         ax4.grid(True, alpha=0.3)
+        ax4.set_xlim(left=0, right=max(users) * 1.05)
+        ax4.set_ylim(bottom=0, top=105)
         
         plt.tight_layout()
         
@@ -655,9 +781,33 @@ class PerformanceTester:
         print(f"Testing Endpoint: {endpoint_name}")
         print(f"{'='*60}")
         
+        # Get user counts to test
+        user_counts = self.config.get_user_counts()
+        print(f"  Testing with user counts: {user_counts}")
+        print(f"  Total test iterations: {len(user_counts)}")
+        
+        # Get cooldown configuration
+        cooldown_between_tests = getattr(self.config, 'cooldown_between_tests_s', 0)
+        tests_per_set = getattr(self.config, 'tests_per_set', 0)
+        cooldown_between_sets = getattr(self.config, 'cooldown_between_sets_s', 0)
+        
+        # Get auto failure point configuration
+        auto_find_failure = getattr(self.config, 'auto_find_failure_point', False)
+        failure_threshold = getattr(self.config, 'failure_threshold_percent', 50)
+        max_auto_users = getattr(self.config, 'max_auto_users', 10000)
+        user_step = getattr(self.config, 'user_step', 50)
+        
+        if cooldown_between_tests > 0:
+            print(f"  Cooldown between tests: {cooldown_between_tests}s")
+        if tests_per_set > 0 and cooldown_between_sets > 0:
+            print(f"  After {tests_per_set} tests, cooldown: {cooldown_between_sets}s")
+        if auto_find_failure:
+            print(f"  Auto find failure point: ON (threshold: {failure_threshold}%, max users: {max_auto_users})")
+        print()
+        
         metrics_list = []
         
-        for num_users in self.config.user_counts:
+        for test_index, num_users in enumerate(user_counts, start=1):
             test_start = time.time()
             
             results = await self.run_load_test(endpoint, num_users)
@@ -674,10 +824,69 @@ class PerformanceTester:
                   f"Errors: {metrics.error_rate:5.2f}% | "
                   f"Throughput: {metrics.throughput_rps:6.2f} req/s")
             
-            # Stop if error rate is too high
-            if metrics.error_rate > 50:
-                print(f"  WARNING: Stopping test - error rate exceeded 50%")
-                break
+            # Apply cooldown if not the last test
+            if test_index < len(user_counts):
+                # Check if we need a set cooldown
+                if tests_per_set > 0 and cooldown_between_sets > 0 and test_index % tests_per_set == 0:
+                    print(f"    Set cooldown: waiting {cooldown_between_sets}s for system recovery...")
+                    await asyncio.sleep(cooldown_between_sets)
+                # Otherwise apply regular cooldown
+                elif cooldown_between_tests > 0:
+                    print(f"    Cooldown: waiting {cooldown_between_tests}s...")
+                    await asyncio.sleep(cooldown_between_tests)
+        
+        # Check if we need to auto-find failure point
+        if auto_find_failure:
+            max_error_rate = max([m.error_rate for m in metrics_list]) if metrics_list else 0
+            
+            if max_error_rate < failure_threshold:
+                print(f"\n  Auto-finding failure point (current max error rate: {max_error_rate:.2f}%)")
+                print(f"  Target: {failure_threshold}% error rate")
+                print(f"  Continuing tests beyond max_users with step: {user_step}")
+                print()
+                
+                # Continue testing with incremental users
+                current_users = user_counts[-1] if user_counts else user_step
+                test_index = len(user_counts)
+                
+                while max_error_rate < failure_threshold and current_users < max_auto_users:
+                    current_users += user_step
+                    test_index += 1
+                    
+                    # Apply cooldown before test
+                    if tests_per_set > 0 and cooldown_between_sets > 0 and test_index % tests_per_set == 0:
+                        print(f"    Set cooldown: waiting {cooldown_between_sets}s for system recovery...")
+                        await asyncio.sleep(cooldown_between_sets)
+                    elif cooldown_between_tests > 0:
+                        print(f"    Cooldown: waiting {cooldown_between_tests}s...")
+                        await asyncio.sleep(cooldown_between_tests)
+                    
+                    test_start = time.time()
+                    results = await self.run_load_test(endpoint, current_users)
+                    test_duration = time.time() - test_start
+                    
+                    metrics = self.calculate_metrics(results, current_users, test_duration)
+                    metrics_list.append(metrics)
+                    
+                    # Print summary
+                    print(f"    Users: {current_users:4d} | "
+                          f"Avg: {metrics.avg_response_time_ms:7.2f}ms | "
+                          f"P95: {metrics.p95_response_time_ms:7.2f}ms | "
+                          f"Errors: {metrics.error_rate:5.2f}% | "
+                          f"Throughput: {metrics.throughput_rps:6.2f} req/s")
+                    
+                    max_error_rate = metrics.error_rate
+                    
+                    # Check if we reached the threshold
+                    if max_error_rate >= failure_threshold:
+                        print(f"\n  FAILURE THRESHOLD REACHED at {current_users} users ({max_error_rate:.2f}% error rate)")
+                        break
+                
+                if current_users >= max_auto_users:
+                    print(f"\n  Maximum auto users limit reached ({max_auto_users})")
+                    print(f"  Final error rate: {max_error_rate:.2f}%")
+            else:
+                print(f"\n  Failure threshold already reached in initial tests (max error: {max_error_rate:.2f}%)")
         
         # Find knee
         knee_users, knee_score = self.find_knee(metrics_list)
