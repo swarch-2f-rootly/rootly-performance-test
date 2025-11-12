@@ -103,6 +103,9 @@ class PerformanceTestConfig:
             self.ramp_up_period_s = 1  # Time to spawn all users
             self.requests_per_user = 1
             
+            # Test repetition configuration
+            self.test_iterations = 1  # Number of times to run each test and calculate average
+            
             # Cooldown periods for system recovery
             self.cooldown_between_tests_s = 0  # Cooldown after each test iteration
             self.tests_per_set = 10  # Number of tests before a longer cooldown
@@ -582,6 +585,79 @@ class PerformanceTester:
             sent_kb_sec=sent_kb_sec
         )
     
+    def calculate_average_metrics(self, metrics_iterations: List[List[TestMetrics]]) -> List[TestMetrics]:
+        """
+        Calculate average metrics from multiple test iterations
+        Args:
+            metrics_iterations: List of metrics lists, one per iteration
+        Returns:
+            List of averaged TestMetrics, one per user count level
+        """
+        if not metrics_iterations or not metrics_iterations[0]:
+            return []
+        
+        # Number of user levels tested
+        num_user_levels = len(metrics_iterations[0])
+        averaged_metrics = []
+        
+        for user_level_idx in range(num_user_levels):
+            # Collect all metrics for this user level across iterations
+            level_metrics = []
+            for iteration_metrics in metrics_iterations:
+                if user_level_idx < len(iteration_metrics):
+                    level_metrics.append(iteration_metrics[user_level_idx])
+            
+            if not level_metrics:
+                continue
+            
+            # Calculate averages for each metric
+            num_users = level_metrics[0].num_users  # Should be same across iterations
+            total_requests = sum(m.total_requests for m in level_metrics) // len(level_metrics)
+            successful_requests = sum(m.successful_requests for m in level_metrics) // len(level_metrics)
+            failed_requests = sum(m.failed_requests for m in level_metrics) // len(level_metrics)
+            error_rate = sum(m.error_rate for m in level_metrics) / len(level_metrics)
+            
+            avg_response_time_ms = sum(m.avg_response_time_ms for m in level_metrics) / len(level_metrics)
+            min_response_time_ms = sum(m.min_response_time_ms for m in level_metrics) / len(level_metrics)
+            max_response_time_ms = sum(m.max_response_time_ms for m in level_metrics) / len(level_metrics)
+            median_response_time_ms = sum(m.median_response_time_ms for m in level_metrics) / len(level_metrics)
+            p90_response_time_ms = sum(m.p90_response_time_ms for m in level_metrics) / len(level_metrics)
+            p95_response_time_ms = sum(m.p95_response_time_ms for m in level_metrics) / len(level_metrics)
+            p99_response_time_ms = sum(m.p99_response_time_ms for m in level_metrics) / len(level_metrics)
+            std_dev_ms = sum(m.std_dev_ms for m in level_metrics) / len(level_metrics)
+            
+            throughput_rps = sum(m.throughput_rps for m in level_metrics) / len(level_metrics)
+            total_duration_s = sum(m.total_duration_s for m in level_metrics) / len(level_metrics)
+            turnaround_time_ms = sum(m.turnaround_time_ms for m in level_metrics) / len(level_metrics)
+            received_kb_sec = sum(m.received_kb_sec for m in level_metrics) / len(level_metrics)
+            sent_kb_sec = sum(m.sent_kb_sec for m in level_metrics) / len(level_metrics)
+            
+            # Create averaged metrics object
+            averaged_metric = TestMetrics(
+                num_users=num_users,
+                total_requests=total_requests,
+                successful_requests=successful_requests,
+                failed_requests=failed_requests,
+                error_rate=error_rate,
+                avg_response_time_ms=avg_response_time_ms,
+                min_response_time_ms=min_response_time_ms,
+                max_response_time_ms=max_response_time_ms,
+                median_response_time_ms=median_response_time_ms,
+                p90_response_time_ms=p90_response_time_ms,
+                p95_response_time_ms=p95_response_time_ms,
+                p99_response_time_ms=p99_response_time_ms,
+                std_dev_ms=std_dev_ms,
+                throughput_rps=throughput_rps,
+                total_duration_s=total_duration_s,
+                turnaround_time_ms=turnaround_time_ms,
+                received_kb_sec=received_kb_sec,
+                sent_kb_sec=sent_kb_sec
+            )
+            
+            averaged_metrics.append(averaged_metric)
+        
+        return averaged_metrics
+    
     def find_knee(self, metrics_list: List[TestMetrics]) -> Tuple[int, float]:
         """
         Find the knee point in the performance curve
@@ -839,7 +915,13 @@ class PerformanceTester:
     def save_results_csv(self, metrics_list: List[TestMetrics], endpoint_name: str):
         """Save metrics to CSV file"""
         timestamp = self.test_start_time.strftime('%Y%m%d_%H%M%S')
-        csv_file = self.output_dir / f"{endpoint_name}_metrics_{timestamp}.csv"
+        test_iterations = getattr(self.config, 'test_iterations', 1)
+        
+        # Add iteration info to filename if multiple iterations were used
+        if test_iterations > 1:
+            csv_file = self.output_dir / f"{endpoint_name}_metrics_avg_{test_iterations}iter_{timestamp}.csv"
+        else:
+            csv_file = self.output_dir / f"{endpoint_name}_metrics_{timestamp}.csv"
         
         with open(csv_file, 'w', newline='') as f:
             if metrics_list:
@@ -848,7 +930,10 @@ class PerformanceTester:
                 for metrics in metrics_list:
                     writer.writerow(asdict(metrics))
         
-        print(f"  Results saved to: {csv_file}")
+        if test_iterations > 1:
+            print(f"  Results (averaged from {test_iterations} iterations) saved to: {csv_file}")
+        else:
+            print(f"  Results saved to: {csv_file}")
     
     def generate_plots(self, metrics_list: List[TestMetrics], endpoint_name: str, knee_users: int):
         """Generate performance plots with regression analysis and anomaly detection"""
@@ -896,7 +981,15 @@ class PerformanceTester:
         
         # Create figure with subplots
         fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-        fig.suptitle(f'Performance Analysis with Regression - {endpoint_name}', fontsize=16, fontweight='bold')
+        
+        # Add iteration info to title if applicable
+        test_iterations = getattr(self.config, 'test_iterations', 1)
+        if test_iterations > 1:
+            title = f'Performance Analysis with Regression - {endpoint_name} (Averaged from {test_iterations} iterations)'
+        else:
+            title = f'Performance Analysis with Regression - {endpoint_name}'
+        
+        fig.suptitle(title, fontsize=16, fontweight='bold')
         
         # 1. Response Time vs Users with Regression
         ax1 = axes[0, 0]
@@ -1038,7 +1131,13 @@ class PerformanceTester:
         
         # Save plot
         timestamp = self.test_start_time.strftime('%Y%m%d_%H%M%S')
-        plot_file = self.output_dir / f"{endpoint_name}_performance_{timestamp}.png"
+        test_iterations = getattr(self.config, 'test_iterations', 1)
+        
+        # Add iteration info to filename if multiple iterations were used
+        if test_iterations > 1:
+            plot_file = self.output_dir / f"{endpoint_name}_performance_avg_{test_iterations}iter_{timestamp}.png"
+        else:
+            plot_file = self.output_dir / f"{endpoint_name}_performance_{timestamp}.png"
         
         try:
             plt.savefig(plot_file, dpi=300, bbox_inches='tight')
@@ -1083,7 +1182,7 @@ class PerformanceTester:
             plt.close('all')  # Close any remaining figures
     
     async def test_endpoint(self, endpoint: Dict[str, Any]):
-        """Test a single endpoint across all user counts"""
+        """Test a single endpoint across all user counts with multiple iterations"""
         endpoint_name = endpoint['name']
         print(f"\n{'='*60}")
         print(f"Testing Endpoint: {endpoint_name}")
@@ -1091,8 +1190,13 @@ class PerformanceTester:
         
         # Get user counts to test
         user_counts = self.config.get_user_counts()
+        
+        # Get test iterations configuration
+        test_iterations = getattr(self.config, 'test_iterations', 1)
+        
         print(f"  Testing with user counts: {user_counts}")
-        print(f"  Total test iterations: {len(user_counts)}")
+        print(f"  Test iterations per user count: {test_iterations}")
+        print(f"  Total test iterations: {len(user_counts) * test_iterations}")
         
         # Get cooldown configuration
         cooldown_between_tests = getattr(self.config, 'cooldown_between_tests_s', 0)
@@ -1111,37 +1215,76 @@ class PerformanceTester:
             print(f"  After {tests_per_set} tests, cooldown: {cooldown_between_sets}s")
         if auto_find_failure:
             print(f"  Auto find failure point: ON (threshold: {failure_threshold}%, max users: {max_auto_users})")
+        if test_iterations > 1:
+            print(f"  Multiple iterations enabled: each test will run {test_iterations} times and results will be averaged")
         print()
         
-        metrics_list = []
+        # Store all iterations for averaging
+        all_iterations_metrics = []
         
-        for test_index, num_users in enumerate(user_counts, start=1):
-            test_start = time.time()
+        # Run multiple iterations for each user count
+        for iteration in range(test_iterations):
+            if test_iterations > 1:
+                print(f"\n  --- ITERATION {iteration + 1}/{test_iterations} ---")
             
-            results = await self.run_load_test(endpoint, num_users)
+            iteration_metrics = []
             
-            test_duration = time.time() - test_start
+            for test_index, num_users in enumerate(user_counts, start=1):
+                test_start = time.time()
+                
+                results = await self.run_load_test(endpoint, num_users)
+                
+                test_duration = time.time() - test_start
+                
+                metrics = self.calculate_metrics(results, num_users, test_duration)
+                iteration_metrics.append(metrics)
+                
+                # Print summary for this iteration
+                if test_iterations > 1:
+                    print(f"    Iter {iteration + 1} - Users: {num_users:4d} | "
+                          f"Avg: {metrics.avg_response_time_ms:7.2f}ms | "
+                          f"P95: {metrics.p95_response_time_ms:7.2f}ms | "
+                          f"Errors: {metrics.error_rate:5.2f}% | "
+                          f"Throughput: {metrics.throughput_rps:6.2f} req/s")
+                else:
+                    print(f"    Users: {num_users:4d} | "
+                          f"Avg: {metrics.avg_response_time_ms:7.2f}ms | "
+                          f"P95: {metrics.p95_response_time_ms:7.2f}ms | "
+                          f"Errors: {metrics.error_rate:5.2f}% | "
+                          f"Throughput: {metrics.throughput_rps:6.2f} req/s")
+                
+                # Apply cooldown if not the last test in this iteration
+                if test_index < len(user_counts):
+                    # Check if we need a set cooldown
+                    if tests_per_set > 0 and cooldown_between_sets > 0 and test_index % tests_per_set == 0:
+                        print(f"    Set cooldown: waiting {cooldown_between_sets}s for system recovery...")
+                        await asyncio.sleep(cooldown_between_sets)
+                    # Otherwise apply regular cooldown
+                    elif cooldown_between_tests > 0:
+                        print(f"    Cooldown: waiting {cooldown_between_tests}s...")
+                        await asyncio.sleep(cooldown_between_tests)
             
-            metrics = self.calculate_metrics(results, num_users, test_duration)
-            metrics_list.append(metrics)
+            all_iterations_metrics.append(iteration_metrics)
             
-            # Print summary
-            print(f"    Users: {num_users:4d} | "
-                  f"Avg: {metrics.avg_response_time_ms:7.2f}ms | "
-                  f"P95: {metrics.p95_response_time_ms:7.2f}ms | "
-                  f"Errors: {metrics.error_rate:5.2f}% | "
-                  f"Throughput: {metrics.throughput_rps:6.2f} req/s")
+            # Apply cooldown between iterations if not the last iteration
+            if iteration < test_iterations - 1 and cooldown_between_tests > 0:
+                print(f"    Iteration cooldown: waiting {cooldown_between_tests}s...")
+                await asyncio.sleep(cooldown_between_tests)
+        
+        # Calculate averaged metrics if multiple iterations
+        if test_iterations > 1:
+            print(f"\n  --- CALCULATING AVERAGES FROM {test_iterations} ITERATIONS ---")
+            metrics_list = self.calculate_average_metrics(all_iterations_metrics)
             
-            # Apply cooldown if not the last test
-            if test_index < len(user_counts):
-                # Check if we need a set cooldown
-                if tests_per_set > 0 and cooldown_between_sets > 0 and test_index % tests_per_set == 0:
-                    print(f"    Set cooldown: waiting {cooldown_between_sets}s for system recovery...")
-                    await asyncio.sleep(cooldown_between_sets)
-                # Otherwise apply regular cooldown
-                elif cooldown_between_tests > 0:
-                    print(f"    Cooldown: waiting {cooldown_between_tests}s...")
-                    await asyncio.sleep(cooldown_between_tests)
+            # Print averaged results
+            for metrics in metrics_list:
+                print(f"    Avg - Users: {metrics.num_users:4d} | "
+                      f"Avg: {metrics.avg_response_time_ms:7.2f}ms | "
+                      f"P95: {metrics.p95_response_time_ms:7.2f}ms | "
+                      f"Errors: {metrics.error_rate:5.2f}% | "
+                      f"Throughput: {metrics.throughput_rps:6.2f} req/s")
+        else:
+            metrics_list = all_iterations_metrics[0]
         
         # Check if we need to auto-find failure point
         if auto_find_failure:
@@ -1161,29 +1304,58 @@ class PerformanceTester:
                     current_users += user_step
                     test_index += 1
                     
-                    # Apply cooldown before test
-                    if tests_per_set > 0 and cooldown_between_sets > 0 and test_index % tests_per_set == 0:
-                        print(f"    Set cooldown: waiting {cooldown_between_sets}s for system recovery...")
-                        await asyncio.sleep(cooldown_between_sets)
-                    elif cooldown_between_tests > 0:
-                        print(f"    Cooldown: waiting {cooldown_between_tests}s...")
-                        await asyncio.sleep(cooldown_between_tests)
+                    # Run multiple iterations for auto-find tests too
+                    auto_iterations_metrics = []
                     
-                    test_start = time.time()
-                    results = await self.run_load_test(endpoint, current_users)
-                    test_duration = time.time() - test_start
+                    for auto_iteration in range(test_iterations):
+                        if test_iterations > 1:
+                            print(f"    Auto-find Iter {auto_iteration + 1}/{test_iterations} - Users: {current_users}")
+                        
+                        # Apply cooldown before test
+                        if auto_iteration == 0:  # Only cooldown before first iteration
+                            if tests_per_set > 0 and cooldown_between_sets > 0 and test_index % tests_per_set == 0:
+                                print(f"    Set cooldown: waiting {cooldown_between_sets}s for system recovery...")
+                                await asyncio.sleep(cooldown_between_sets)
+                            elif cooldown_between_tests > 0:
+                                print(f"    Cooldown: waiting {cooldown_between_tests}s...")
+                                await asyncio.sleep(cooldown_between_tests)
+                        
+                        test_start = time.time()
+                        results = await self.run_load_test(endpoint, current_users)
+                        test_duration = time.time() - test_start
+                        
+                        metrics = self.calculate_metrics(results, current_users, test_duration)
+                        auto_iterations_metrics.append([metrics])
+                        
+                        # Print summary for this iteration
+                        if test_iterations > 1:
+                            print(f"      Iter {auto_iteration + 1} - "
+                                  f"Avg: {metrics.avg_response_time_ms:7.2f}ms | "
+                                  f"P95: {metrics.p95_response_time_ms:7.2f}ms | "
+                                  f"Errors: {metrics.error_rate:5.2f}% | "
+                                  f"Throughput: {metrics.throughput_rps:6.2f} req/s")
+                        
+                        # Small cooldown between auto-find iterations
+                        if auto_iteration < test_iterations - 1 and cooldown_between_tests > 0:
+                            await asyncio.sleep(cooldown_between_tests // 2)  # Shorter cooldown
                     
-                    metrics = self.calculate_metrics(results, current_users, test_duration)
-                    metrics_list.append(metrics)
+                    # Calculate average for auto-find tests if multiple iterations
+                    if test_iterations > 1:
+                        averaged_metrics = self.calculate_average_metrics(auto_iterations_metrics)
+                        final_metrics = averaged_metrics[0] if averaged_metrics else auto_iterations_metrics[0][0]
+                    else:
+                        final_metrics = auto_iterations_metrics[0][0]
                     
-                    # Print summary
+                    metrics_list.append(final_metrics)
+                    
+                    # Print final averaged summary
                     print(f"    Users: {current_users:4d} | "
-                          f"Avg: {metrics.avg_response_time_ms:7.2f}ms | "
-                          f"P95: {metrics.p95_response_time_ms:7.2f}ms | "
-                          f"Errors: {metrics.error_rate:5.2f}% | "
-                          f"Throughput: {metrics.throughput_rps:6.2f} req/s")
+                          f"Avg: {final_metrics.avg_response_time_ms:7.2f}ms | "
+                          f"P95: {final_metrics.p95_response_time_ms:7.2f}ms | "
+                          f"Errors: {final_metrics.error_rate:5.2f}% | "
+                          f"Throughput: {final_metrics.throughput_rps:6.2f} req/s")
                     
-                    max_error_rate = metrics.error_rate
+                    max_error_rate = final_metrics.error_rate
                     
                     # Check if we reached the threshold
                     if max_error_rate >= failure_threshold:
@@ -1262,6 +1434,14 @@ class PerformanceTester:
             f.write("="*70 + "\n")
             f.write(f"Test Date: {self.test_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Base URL: {self.config.base_url}\n")
+            
+            # Add iteration information
+            test_iterations = getattr(self.config, 'test_iterations', 1)
+            if test_iterations > 1:
+                f.write(f"Test Iterations: {test_iterations} (results are averaged)\n")
+            else:
+                f.write(f"Test Iterations: {test_iterations} (single run per user level)\n")
+            
             f.write("\n")
             
             for endpoint_name, data in all_results.items():
