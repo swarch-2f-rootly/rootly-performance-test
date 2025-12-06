@@ -76,7 +76,7 @@ class TestMetrics:
 class PerformanceTestConfig:
     """Configuration for performance tests"""
     
-    def __init__(self, config_file: str = None):
+    def __init__(self, config_file: str = "config.json"):
         if config_file and Path(config_file).exists():
             with open(config_file, 'r') as f:
                 config_data = json.load(f)

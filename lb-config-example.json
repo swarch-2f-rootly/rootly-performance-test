@@ -13,7 +13,7 @@
   "user_step": 200,
   "ramp_up_period_s": 1,
   "requests_per_user": 1,
-  "test_iterations": 1,
+  "test_iterations": 3,
   "cooldown_between_tests_s": 0,
   "tests_per_set": 0,
   "cooldown_between_sets_s": 0,
@@ -24,7 +24,7 @@
   "max_workers": 500,
   "endpoints": [
     {
-      "name": "graphql_analytics_comprehensive",
+      "name": "graphql_analytics",
       "method": "POST",
       "path": "/api/v1/graphql",
       "port": 80,
@@ -32,8 +32,10 @@
         "Content-Type": "application/json"
       },
       "body": {
-        "query": "query ComprehensiveAnalytics { getComprehensiveAnalyticsReport(input: { controllerIds: [\"FARM-001\", \"GREENHOUSE-002\"] metrics: [\"temperature\", \"humidity\", \"soil_moisture\", \"light_intensity\"] filters: { realTime: false startTime: \"2025-01-01T00:00:00Z\" endTime: \"2025-12-31T23:59:59Z\" } }) { summary controllerAnalytics crossControllerAnalysis performance } }",
-        "variables": {}
+        "query": "query GetPlantMetrics($plantId: ID!) { plant(id: $plantId) { id name metrics { temperature humidity soilMoisture } } }",
+        "variables": {
+          "plantId": "1"
+        }
       }
     }
   ]
